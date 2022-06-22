@@ -1,0 +1,891 @@
+// =============================================================
+// Evolving Locomotion
+// Dec 2021
+// Eduardo Izquierdo
+// =============================================================
+
+#include <iostream>
+#include <iomanip>
+#include <math.h>
+#include "TSearch.h"
+#include "VectorMatrix.h"
+#include "Worm.h"
+#include <stdio.h>
+
+#define EVOLVE
+#define PRINTTOFILE
+
+int skip_steps = 10;
+using namespace std;
+
+// Integration parameters
+const int Duration = 24;
+const double Transient = 8.0;
+const double StepSize = 0.005;
+const int N_curvs = 23;
+
+// Fitness traj
+const double    AvgSpeed = 0.0001; //0.00022;              // Average speed of the worm in meters per seconds
+const double    BBCfit = AvgSpeed*Duration;
+
+// Genotype -> Phenotype Mapping Ranges
+const double    BiasRange               = 16.0; //15.0;
+const double    SCRange                 = 16.0; //15.0;
+const double    CSRange                 = 16.0; //15.0;
+const double    ESRange                 = 2.0;
+const double    SRmax                   = 200.0;
+const double    NMJmax                  = 0.8; //1.2;
+const double    NMJmin                  = 0.0;
+
+const int SR_A = 1;
+const int SR_B = 2;
+
+// Size of genotype
+int	VectSize = 17;
+
+// ------------------------------------
+// Genotype-Phenotype Mapping
+// ------------------------------------
+void GenPhenMapping(TVector<double> &gen, TVector<double> &phen)
+{
+  // Parameters for the Stretch Receptors
+  phen(SR_A) = MapSearchParameter(gen(SR_A), 0.0, SRmax);
+  phen(SR_B) = MapSearchParameter(gen(SR_B), 0.0, SRmax);
+
+  // Bias
+  int k=3;
+  for (int i = 1; i <= 3; i++){
+    phen(k) = MapSearchParameter(gen(k), -BiasRange, BiasRange);k++;
+  }
+  // Self connections
+  for (int i = 1; i <= 3; i++){
+    phen(k) = MapSearchParameter(gen(k), -SCRange, SCRange);k++;
+  }
+  // DA, DB, VA, VB Chemical synapses (excitatory)
+  for (int i = 1; i <= 2; i++){
+    phen(k) = MapSearchParameter(gen(k), 0.0, CSRange);k++;
+  }
+  // VD Chemical synapses (Inhibitory)
+  for (int i = 1; i <= 2; i++){
+    phen(k) = MapSearchParameter(gen(k), -CSRange, 0.0);k++;
+  }
+  // Interunits Gap junctions
+  for (int i = 1; i <= 2; i++){
+    phen(k) = MapSearchParameter(gen(k), 0.0, ESRange);k++;
+  }
+  // Excitatory NMJ Weight
+  for (int i = 1; i <= 2; i++){
+    phen(k) = MapSearchParameter(gen(k), NMJmin, NMJmax);k++;
+  }
+  // Inhibitory NMJ Weight
+  for (int i = 1; i <= 1; i++){
+    phen(k) = MapSearchParameter(gen(k), -NMJmax, -NMJmin);k++;
+  }
+}
+
+// ------------------------------------
+// Fitness function
+// ------------------------------------
+double Evaluation(TVector<double> &v, RandomState &rs, int direction){
+    double fitA,fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled = 0, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+    Worm w(phenotype, 1);
+    w.InitializeState(rs);
+
+    if (direction == 1){
+        w.AVA_output =  0.0;
+        w.AVB_output =  1.0;
+    }
+    else{
+        w.AVA_output =  1.0;
+        w.AVB_output =  0.0; // Command Interneuron Activation Backward
+    }
+
+    // Transient
+    for (double t = 0.0; t <= Transient; t += StepSize){
+        w.Step(StepSize, 1);
+    }
+    xt = w.CoMx(); yt = w.CoMy();
+    oxt = w.CoMx(); oyt = w.CoMy();
+    // Run
+    for (double t = 0.0; t <= Duration; t += StepSize) {
+        w.Step(StepSize, 1);
+        // Current and past centroid position
+        xtp = xt; ytp = yt;
+        xt = w.CoMx(); yt = w.CoMy();
+        // Integration error check
+        if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+        // Velocity Fitness
+        bodyorientation = w.Orientation();                  // Orientation of the body position
+        movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+        anglediff = movementorientation - bodyorientation;  // Check how orientations align
+        if (direction == 1){
+            temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+        }
+        else{
+            temp = cos(anglediff) > 0.0 ? -1.0 : 1.0;           // Add to fitness only movement backward
+        }
+        distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+    }
+    fxt = w.CoMx(); fyt = w.CoMy();
+    distance = sqrt(pow(oxt-fxt,2)+pow(oyt-fyt,2));
+    fitA = 1 - (fabs(BBCfit - distance)/BBCfit);
+    fitA = (fitA > 0)? fitA : 0.0;
+
+    fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+    fitB = (fitB > 0)? fitB : 0.0;
+    return fitB;
+}
+
+// ------------------------------------
+// Fitness Function
+// ------------------------------------
+double EvaluationFunction(TVector<double> &v, RandomState &rs){
+  double sra = v(SR_A);
+  double srb = v(SR_B);
+  double fitnessForward, fitnessBackward;
+//  v(SR_A)= -1.0;
+//  v(SR_B)= srb;
+//  fitnessForward = Evaluation(v, rs, 1);
+   v(SR_A)= sra;
+   v(SR_B)= -1.0;
+   fitnessBackward = Evaluation(v, rs, -1);
+  //return (fitnessForward + fitnessBackward)/2;
+  //return fitnessForward;
+  return fitnessBackward;
+}
+
+// ------------------------------------
+// Plotting
+// ------------------------------------
+double save_traces(TVector<double> &v, RandomState &rs){
+    ofstream curvfile("curv.dat");
+    ofstream bodyfile("body.dat");
+    ofstream actfile("act.dat");
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+    double sra = phenotype(SR_A);
+    double srb = phenotype(SR_B);
+    Worm w(phenotype, 1);
+    ofstream phenfile("phenotype.dat");
+    w.DumpParams(phenfile);
+
+    w.InitializeState(rs);
+    w.sr.SR_A_gain = 0.0;
+    w.sr.SR_B_gain = srb;
+    w.AVA_output =  w.AVA_inact;
+    w.AVB_output =  w.AVB_act;
+
+    for (double t = 0.0; t <= Transient + Duration; t += StepSize){
+        w.Step(StepSize, 1);
+        w.DumpBodyState(bodyfile, skip_steps);
+        w.DumpCurvature(curvfile, skip_steps);
+        w.DumpActState(actfile, skip_steps);
+    }
+
+     w.sr.SR_A_gain = 0.0;
+     w.sr.SR_B_gain = 0.0;
+
+     for (double t = 0.0; t <= (12); t += StepSize){
+         w.Step(StepSize, 1);
+         w.DumpBodyState(bodyfile, skip_steps);
+         w.DumpCurvature(curvfile, skip_steps);
+         w.DumpActState(actfile, skip_steps);
+     }
+
+     w.sr.SR_A_gain = sra;
+     w.sr.SR_B_gain = 0.0;
+     w.AVA_output =  w.AVA_act;
+     w.AVB_output =  w.AVB_inact;
+
+     for (double t = 0.0; t <= (20); t += StepSize){
+         w.Step(StepSize, 1);
+         w.DumpBodyState(bodyfile, skip_steps);
+         w.DumpCurvature(curvfile, skip_steps);
+         w.DumpActState(actfile, skip_steps);
+     }
+
+     w.sr.SR_A_gain = 0.0;
+     w.sr.SR_B_gain = 0.0;
+
+     for (double t = 0.0; t <= (12); t += StepSize){
+         w.Step(StepSize, 1);
+         w.DumpBodyState(bodyfile, skip_steps);
+         w.DumpCurvature(curvfile, skip_steps);
+         w.DumpActState(actfile, skip_steps);
+     }
+
+    bodyfile.close();
+    curvfile.close();
+    actfile.close();
+    return 0;
+}
+
+// ------------------------------------
+// Plotting
+// ------------------------------------
+double fitnessmap1(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 9;
+    int g2 = 10;
+    ofstream distmap("distmap_0.1_9_10.dat");
+    ofstream fitmap("fitmap_0.1_9_10.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = -CSRange; p1 <= CSRange; p1 += 0.1) {
+        for (double p2 = -CSRange; p2 <= CSRange; p2 += 0.1) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap2(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 11;
+    int g2 = 12;
+    ofstream distmap("distmap_0.1_11_12.dat");
+    ofstream fitmap("fitmap_0.1_11_12.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = -CSRange; p1 <= CSRange; p1 += 0.1) {
+        for (double p2 = -CSRange; p2 <= CSRange; p2 += 0.1) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap3(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 13;
+    int g2 = 14;
+    ofstream distmap("distmap_0.00625_13_14.dat");
+    ofstream fitmap("fitmap_0.00625_13_14.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = 0.0; p1 <= ESRange; p1 += 0.00625) {
+        for (double p2 = 0.0; p2 <= ESRange; p2 += 0.00625) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap4(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 15;
+    int g2 = 16;
+    ofstream distmap("distmap_0.0025_15_16.dat");
+    ofstream fitmap("fitmap_0.0025_15_16.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = 0.0; p1 <= NMJmax; p1 += 0.0025) {
+        for (double p2 = 0.0; p2 <= NMJmax; p2 += 0.0025) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap5(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 4;
+    int g2 = 5;
+    ofstream distmap("distmap_0.1_4_5.dat");
+    ofstream fitmap("fitmap_0.1_4_5.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = -BiasRange; p1 <= BiasRange; p1 += 0.1) {
+        for (double p2 = -BiasRange; p2 <= BiasRange; p2 += 0.1) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap6(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 7;
+    int g2 = 8;
+    ofstream distmap("distmap_0.1_7_8.dat");
+    ofstream fitmap("fitmap_0.1_7_8.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = -CSRange; p1 <= CSRange; p1 += 0.1) {
+        for (double p2 = -CSRange; p2 <= CSRange; p2 += 0.1) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap7(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 3;
+    int g2 = 6;
+    ofstream distmap("distmap_0.1_3_6.dat");
+    ofstream fitmap("fitmap_0.1_3_6.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = -BiasRange; p1 <= BiasRange; p1 += 0.1) {
+        for (double p2 = -CSRange; p2 <= CSRange; p2 += 0.1) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap8(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 4;
+    int g2 = 7;
+    ofstream distmap("distmap_0.1_4_7.dat");
+    ofstream fitmap("fitmap_0.1_4_7.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = -BiasRange; p1 <= BiasRange; p1 += 0.1) {
+        for (double p2 = -CSRange; p2 <= CSRange; p2 += 0.1) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+double fitnessmap9(TVector<double> &v, RandomState &rs){
+
+    double fitB;
+    double bodyorientation, anglediff;
+    double movementorientation, distancetravelled, temp;
+    double distance;
+    double xt, xtp, oxt, fxt;
+    double yt, ytp, oyt, fyt;
+
+    // Genotype-Phenotype Mapping
+    TVector<double> phenotype(1, VectSize);
+    GenPhenMapping(v, phenotype);
+
+    int g1 = 5;
+    int g2 = 8;
+    ofstream distmap("distmap_0.1_5_8.dat");
+    ofstream fitmap("fitmap_0.1_5_8.dat");
+    cout << g1 << ", " << g2 << endl;
+    cout << phenotype(g1) << ", " << phenotype(g2) << endl;
+    for (double p1 = -BiasRange; p1 <= BiasRange; p1 += 0.1) {
+        for (double p2 = -CSRange; p2 <= CSRange; p2 += 0.1) {
+            phenotype(g1) = p1;
+            phenotype(g2) = p2;
+
+            Worm w(phenotype, 1);
+            w.InitializeState(rs);
+            w.AVA_output =  0.0;
+            w.AVB_output =  1.0;
+
+            // Transient
+            for (double t = 0.0; t <= Transient; t += StepSize){
+                w.Step(StepSize, 1);
+            }
+            xt = w.CoMx(); yt = w.CoMy();
+            distancetravelled = 0.0;
+            // Run
+            for (double t = 0.0; t <= Duration; t += StepSize) {
+                w.Step(StepSize, 1);
+                // Current and past centroid position
+                xtp = xt; ytp = yt;
+                xt = w.CoMx(); yt = w.CoMy();
+                // Integration error check
+                if (isnan(xt) || isnan(yt) || sqrt(pow(xt-xtp,2)+pow(yt-ytp,2)) > 10*AvgSpeed*StepSize) {return 0.0;}
+                // Velocity Fitness
+                bodyorientation = w.Orientation();                  // Orientation of the body position
+                movementorientation = atan2(yt-ytp,xt-xtp);         // Orientation of the movement
+                anglediff = movementorientation - bodyorientation;  // Check how orientations align
+                temp = cos(anglediff) > 0.0 ? 1.0 : -1.0;           // Add to fitness only movement forward
+                distancetravelled += temp * sqrt(pow(xt-xtp,2)+pow(yt-ytp,2));
+            }
+            fitB = 1 - (fabs(BBCfit-distancetravelled)/BBCfit);
+            fitB = (fitB > 0)? fitB : 0.0;
+            distmap << p1 << " " << p2 << " " << distancetravelled << endl;
+            fitmap << p1 << " " << p2 << " " << fitB << endl;
+        }
+    }
+    distmap.close();
+    fitmap.close();
+    return 0;
+}
+
+// ------------------------------------
+// Display functions
+// ------------------------------------
+void EvolutionaryRunDisplay(int Generation, double BestPerf, double AvgPerf, double PerfVar)
+{
+    cout << Generation << " " << BestPerf << " " << AvgPerf << " " << PerfVar << endl;
+}
+
+void ResultsDisplay(TSearch &s)
+{
+    TVector<double> bestVector;
+    ofstream BestIndividualFile;
+    bestVector = s.BestIndividual();
+    BestIndividualFile.open("best.gen.dat");
+    BestIndividualFile << setprecision(32);
+    BestIndividualFile << bestVector << endl;
+    BestIndividualFile.close();
+}
+
+// ------------------------------------
+// The main program
+// ------------------------------------
+#ifdef EVOLVE
+int main (int argc, const char* argv[])
+{
+    std::cout << std::setprecision(10);
+    long randomseed = static_cast<long>(time(NULL));
+    if (argc == 2)
+        randomseed += atoi(argv[1]);
+
+    TSearch s(VectSize);
+
+    // save the seed to a file
+    ofstream seedfile;
+    seedfile.open ("seed.dat");
+    seedfile << randomseed << endl;
+    seedfile.close();
+
+    // configure the search
+    s.SetRandomSeed(randomseed);
+    s.SetPopulationStatisticsDisplayFunction(EvolutionaryRunDisplay);
+    s.SetSearchResultsDisplayFunction(ResultsDisplay);
+    s.SetSelectionMode(RANK_BASED);               //{FITNESS_PROPORTIONATE,RANK_BASED}
+    s.SetReproductionMode(GENETIC_ALGORITHM);	    // {HILL_CLIMBING, GENETIC_ALGORITHM}
+    s.SetPopulationSize(96);
+    s.SetMaxGenerations(10);
+    s.SetMutationVariance(0.05);                   // For 71 parameters, an estimated avg change of 0.25 for weights (mapped to 15).
+    s.SetCrossoverProbability(0.5);
+    s.SetCrossoverMode(UNIFORM);                  //{UNIFORM, TWO_POINT}
+    s.SetMaxExpectedOffspring(1.1);
+    s.SetElitistFraction(0.02);
+    s.SetSearchConstraint(1);
+    s.SetReEvaluationFlag(0);
+    // redirect standard output to a file
+    #ifdef PRINTTOFILE
+        ofstream evolfile;
+        evolfile.open ("fitness.dat");
+        cout.rdbuf(evolfile.rdbuf());
+    #endif
+    // Code to run simulation:
+    InitializeBodyConstants();
+    s.SetEvaluationFunction(EvaluationFunction);
+    s.ExecuteSearch();
+
+    #ifdef PRINTTOFILE
+        evolfile.close();
+    #endif
+    return 0;
+}
+#else
+int main (int argc, const char* argv[])
+{
+    RandomState rs;
+    long seed = static_cast<long>(time(NULL));
+    rs.SetRandomSeed(seed);
+    std::cout << std::setprecision(10);
+    InitializeBodyConstants();
+    ifstream Best;
+    Best.open("best.gen.dat");
+    TVector<double> best(1, VectSize);
+    Best >> best;
+    save_traces(best, rs);
+    return 0;
+}
+//int main (int argc, const char* argv[])
+//{
+//    RandomState rs;
+//    long seed = static_cast<long>(time(NULL));
+//    rs.SetRandomSeed(seed);
+//    std::cout << std::setprecision(10);
+//    InitializeBodyConstants();
+//    ifstream Best;
+//    Best.open("best.gen.dat");
+//    TVector<double> best(1, VectSize);
+//    Best >> best;
+////    fitnessmap1(best,rs);
+////    fitnessmap2(best,rs);
+////    fitnessmap3(best,rs); //
+////    fitnessmap4(best,rs); //
+////    fitnessmap5(best,rs);
+////    fitnessmap6(best,rs);
+////    fitnessmap7(best,rs);
+////    fitnessmap8(best,rs);
+////    fitnessmap9(best,rs);
+//    return 0;
+//}
+#endif
