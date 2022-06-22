@@ -24,4 +24,7 @@ $ python viz.py
 ```
 $ Mathematica viz.nb
 ```
+
+![Screenshot of the animation of the simulated worm's body in Mathematica](https://github.com/edizquierdo/CE_locomotion/viz.png?raw=true)
+
 Optional. You can also visualize the dynamic neural and muscle activity by plotting "muscles.dat" and "neural.dat".
