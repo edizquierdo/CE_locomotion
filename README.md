@@ -24,3 +24,4 @@ $ python viz.py
 ```
 $ Mathematica viz.nb
 ```
+Optional. You can also visualize the dynamic neural and muscle activity by plotting "muscles.dat" and "neural.dat".
